@@ -1,5 +1,7 @@
 //! Builders for containers.
 
+use std::path::PathBuf;
+
 use bollard::Docker;
 use bollard::secret::Mount;
 use bollard::secret::ServiceSpec;
@@ -32,11 +34,11 @@ pub struct Builder {
     /// The arguments to the command.
     args: Vec<String>,
 
-    /// Whether or not the standard output is attached.
-    attach_stdout: bool,
+    /// The file path to write the container's stdout stream to.
+    stdout: Option<PathBuf>,
 
-    /// Whether or not the standard error is attached.
-    attach_stderr: bool,
+    /// The file path to write the container's stderr stream to.
+    stderr: Option<PathBuf>,
 
     /// Environment variables.
     env: IndexMap<String, String>,
@@ -59,8 +61,8 @@ impl Builder {
             image: Default::default(),
             program: Default::default(),
             args: Default::default(),
-            attach_stdout: false,
-            attach_stderr: false,
+            stdout: None,
+            stderr: None,
             env: Default::default(),
             work_dir: Default::default(),
             mounts: Default::default(),
@@ -108,15 +110,15 @@ impl Builder {
         self
     }
 
-    /// Sets stdout to be attached.
-    pub fn attach_stdout(mut self) -> Self {
-        self.attach_stdout = true;
+    /// Sets the file to write the container's stdout stream to.
+    pub fn stdout(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stdout = Some(path.into());
         self
     }
 
-    /// Sets stderr to be attached.
-    pub fn attach_stderr(mut self) -> Self {
-        self.attach_stderr = true;
+    /// Sets the file to write the container's stderr stream to.
+    pub fn stderr(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stderr = Some(path.into());
         self
     }
 
@@ -193,8 +195,8 @@ impl Builder {
         Ok(Service {
             client: self.client,
             id: response.id.expect("service must have an identifier"),
-            attach_stdout: self.attach_stdout,
-            attach_stderr: self.attach_stderr,
+            stdout: self.stdout,
+            stderr: self.stderr,
         })
     }
 }

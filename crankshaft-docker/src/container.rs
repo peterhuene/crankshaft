@@ -5,8 +5,8 @@ use std::io::Cursor;
 use std::os::unix::process::ExitStatusExt as _;
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt as _;
+use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::process::Output;
 
 use bollard::Docker;
 use bollard::body_full;
@@ -18,10 +18,10 @@ use bollard::query_parameters::StartContainerOptions;
 use bollard::query_parameters::UploadToContainerOptions;
 use bollard::query_parameters::WaitContainerOptions;
 use bollard::secret::ContainerWaitResponse;
-use futures::TryStreamExt as _;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt as _;
 use tracing::debug;
-use tracing::trace;
 
 use crate::Error;
 use crate::Result;
@@ -46,11 +46,11 @@ pub struct Container {
     /// The name of the container.
     name: String,
 
-    /// Whether or not standard output is attached.
-    attach_stdout: bool,
+    /// The path to the file to write the container's stdout stream to.
+    stdout: Option<PathBuf>,
 
-    /// Whether or not standard output is attached.
-    attach_stderr: bool,
+    /// The path to the file to write the container's stderr stream to.
+    stderr: Option<PathBuf>,
 }
 
 impl Container {
@@ -59,12 +59,17 @@ impl Container {
     /// You should typically use [`Self::builder()`] unless you receive the
     /// container name externally from a user (say, on the command line as an
     /// argument).
-    pub fn new(client: Docker, name: String, attach_stdout: bool, attach_stderr: bool) -> Self {
+    pub fn new(
+        client: Docker,
+        name: String,
+        stdout: Option<PathBuf>,
+        stderr: Option<PathBuf>,
+    ) -> Self {
         Self {
             client,
             name,
-            attach_stdout,
-            attach_stderr,
+            stdout,
+            stderr,
         }
     }
 
@@ -97,22 +102,30 @@ impl Container {
     }
 
     /// Runs a container and waits for the execution to end.
-    pub async fn run(&self, started: impl FnOnce()) -> Result<Output> {
-        // Attach to the logs stream.
-        let stream = self
-            .client
-            .attach_container(
-                &self.name,
-                Some(AttachContainerOptions {
-                    stdout: self.attach_stdout,
-                    stderr: self.attach_stderr,
-                    stream: true,
-                    ..Default::default()
-                }),
+    pub async fn run(&self, started: impl FnOnce()) -> Result<ExitStatus> {
+        // Attach to the container before we start it
+        let stream = if self.stdout.is_some() || self.stderr.is_some() {
+            debug!("attaching to container `{name}`", name = self.name);
+
+            // Attach to the logs stream.
+            Some(
+                self.client
+                    .attach_container(
+                        &self.name,
+                        Some(AttachContainerOptions {
+                            stdout: self.stdout.is_some(),
+                            stderr: self.stderr.is_some(),
+                            stream: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .map_err(Error::Docker)?
+                    .output,
             )
-            .await
-            .map_err(Error::Docker)?
-            .output;
+        } else {
+            None
+        };
 
         debug!("starting container `{name}`", name = self.name);
 
@@ -125,34 +138,64 @@ impl Container {
         // Notify that the container has started
         started();
 
-        // Collect standard out/standard err.
-        let (stdout, stderr) = stream
-            .try_fold(
-                (
-                    Vec::<u8>::with_capacity(0x0FFF),
-                    Vec::<u8>::with_capacity(0x0FFF),
-                ),
-                |(mut stdout, mut stderr), log| async move {
-                    match log {
-                        LogOutput::StdOut { message } => {
-                            stdout.extend(&message);
-                        }
-                        LogOutput::StdErr { message } => {
-                            stderr.extend(&message);
-                        }
-                        v => {
-                            trace!("unhandled log message: {v:?}")
-                        }
-                    }
+        // Write the log streams
+        if self.stdout.is_some() || self.stderr.is_some() {
+            let mut stdout = match &self.stdout {
+                Some(path) => Some(File::create(path).await.map_err(|e| {
+                    Error::Message(format!(
+                        "failed to create stdout file `{path}`: {e}",
+                        path = path.display()
+                    ))
+                })?),
+                None => None,
+            };
 
-                    Ok((stdout, stderr))
-                },
-            )
-            .await
-            .map_err(Error::Docker)?;
+            let mut stderr = match &self.stderr {
+                Some(path) => Some(File::create(path).await.map_err(|e| {
+                    Error::Message(format!(
+                        "failed to create stderr file `{path}`: {e}",
+                        path = path.display()
+                    ))
+                })?),
+                None => None,
+            };
+
+            let mut stream = stream.expect("should have attached to the container");
+            while let Some(result) = stream.next().await {
+                let output = result.map_err(Error::Docker)?;
+                match output {
+                    LogOutput::StdOut { message } => {
+                        stdout
+                            .as_mut()
+                            .unwrap()
+                            .write(&message)
+                            .await
+                            .map_err(|e| {
+                                Error::Message(format!(
+                                    "failed to write to stdout file `{path}`: {e}",
+                                    path = self.stdout.as_ref().unwrap().display()
+                                ))
+                            })?;
+                    }
+                    LogOutput::StdErr { message } => {
+                        stderr
+                            .as_mut()
+                            .unwrap()
+                            .write(&message)
+                            .await
+                            .map_err(|e| {
+                                Error::Message(format!(
+                                    "failed to write to stderr file `{path}`: {e}",
+                                    path = self.stderr.as_ref().unwrap().display()
+                                ))
+                            })?;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Wait for the container to be completed.
-
         debug!("waiting for container `{name}` to exit", name = self.name);
         let mut wait_stream = self
             .client
@@ -189,22 +232,14 @@ impl Container {
             );
         }
 
+        // See WEXITSTATUS from wait(2) to explain the shift
         #[cfg(unix)]
-        let output = Output {
-            // See WEXITSTATUS from wait(2) to explain the shift
-            status: ExitStatus::from_raw((exit_code.unwrap() as i32) << 8),
-            stdout,
-            stderr,
-        };
+        let status = ExitStatus::from_raw((exit_code.unwrap() as i32) << 8);
 
         #[cfg(windows)]
-        let output = Output {
-            status: ExitStatus::from_raw(exit_code.unwrap() as u32),
-            stdout,
-            stderr,
-        };
+        let status = ExitStatus::from_raw(exit_code.unwrap() as u32);
 
-        Ok(output)
+        Ok(status)
     }
 
     /// Removes a container with the level of force specified.

@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt as _;
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt as _;
+use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::process::Output;
 use std::time::Duration;
 
 use bollard::Docker;
@@ -22,7 +22,8 @@ mod builder;
 
 pub use builder::Builder;
 use futures::StreamExt;
-use futures::TryStreamExt;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 use tracing::debug;
 use tracing::trace;
@@ -47,11 +48,11 @@ pub struct Service {
     /// The name of the service.
     id: String,
 
-    /// Whether or not standard output is attached.
-    attach_stdout: bool,
+    /// The path to the file to write the container's stdout stream to.
+    stdout: Option<PathBuf>,
 
-    /// Whether or not standard output is attached.
-    attach_stderr: bool,
+    /// The path to the file to write the container's stderr stream to.
+    stderr: Option<PathBuf>,
 }
 
 impl Service {
@@ -60,17 +61,22 @@ impl Service {
     /// You should typically use [`Self::builder()`] unless you receive the
     /// service name externally from a user (say, on the command line as an
     /// argument).
-    pub fn new(client: Docker, id: String, attach_stdout: bool, attach_stderr: bool) -> Self {
+    pub fn new(
+        client: Docker,
+        id: String,
+        stdout: Option<PathBuf>,
+        stderr: Option<PathBuf>,
+    ) -> Self {
         Self {
             client,
             id,
-            attach_stdout,
-            attach_stderr,
+            stdout,
+            stderr,
         }
     }
 
     /// Runs a service and waits for the task execution to end.
-    pub async fn run(&self, started: impl FnOnce()) -> Result<Output> {
+    pub async fn run(&self, started: impl FnOnce()) -> Result<ExitStatus> {
         let (container_id, exit_code) = loop {
             trace!("polling tasks for service `{id}`", id = self.id);
 
@@ -225,56 +231,79 @@ impl Service {
             }
         };
 
-        // Attach to the logs stream.
-        let stream = self.client.logs(
-            &container_id,
-            Some(LogsOptions {
-                stdout: self.attach_stdout,
-                stderr: self.attach_stderr,
-                ..Default::default()
-            }),
-        );
+        // Write the log streams
+        if self.stdout.is_some() || self.stderr.is_some() {
+            let mut stdout = match &self.stdout {
+                Some(path) => Some(File::create(path).await.map_err(|e| {
+                    Error::Message(format!(
+                        "failed to create stdout file `{path}`: {e}",
+                        path = path.display()
+                    ))
+                })?),
+                None => None,
+            };
 
-        // Collect standard out/standard err.
-        let (stdout, stderr) = stream
-            .try_fold(
-                (
-                    Vec::<u8>::with_capacity(4096),
-                    Vec::<u8>::with_capacity(4096),
-                ),
-                |(mut stdout, mut stderr), log| async move {
-                    match log {
-                        LogOutput::StdOut { message } => {
-                            stdout.extend(&message);
-                        }
-                        LogOutput::StdErr { message } => {
-                            stderr.extend(&message);
-                        }
-                        _ => {}
+            let mut stderr = match &self.stderr {
+                Some(path) => Some(File::create(path).await.map_err(|e| {
+                    Error::Message(format!(
+                        "failed to create stderr file `{path}`: {e}",
+                        path = path.display()
+                    ))
+                })?),
+                None => None,
+            };
+
+            let mut stream = self.client.logs(
+                &container_id,
+                Some(LogsOptions {
+                    stdout: self.stdout.is_some(),
+                    stderr: self.stderr.is_some(),
+                    ..Default::default()
+                }),
+            );
+
+            while let Some(result) = stream.next().await {
+                let output = result.map_err(Error::Docker)?;
+                match output {
+                    LogOutput::StdOut { message } => {
+                        stdout
+                            .as_mut()
+                            .unwrap()
+                            .write(&message)
+                            .await
+                            .map_err(|e| {
+                                Error::Message(format!(
+                                    "failed to write to stdout file `{path}`: {e}",
+                                    path = self.stdout.as_ref().unwrap().display()
+                                ))
+                            })?;
                     }
+                    LogOutput::StdErr { message } => {
+                        stderr
+                            .as_mut()
+                            .unwrap()
+                            .write(&message)
+                            .await
+                            .map_err(|e| {
+                                Error::Message(format!(
+                                    "failed to write to stderr file `{path}`: {e}",
+                                    path = self.stderr.as_ref().unwrap().display()
+                                ))
+                            })?;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
-                    Ok((stdout, stderr))
-                },
-            )
-            .await
-            .map_err(Error::Docker)?;
-
+        // See WEXITSTATUS from wait(2) to explain the shift
         #[cfg(unix)]
-        let output = Output {
-            // See WEXITSTATUS from wait(2) to explain the shift
-            status: ExitStatus::from_raw((exit_code as i32) << 8),
-            stdout,
-            stderr,
-        };
+        let status = ExitStatus::from_raw((exit_code as i32) << 8);
 
         #[cfg(windows)]
-        let output = Output {
-            status: ExitStatus::from_raw(exit_code as u32),
-            stdout,
-            stderr,
-        };
+        let status = ExitStatus::from_raw(exit_code as u32);
 
-        Ok(output)
+        Ok(status)
     }
 
     /// Deletes a service.
