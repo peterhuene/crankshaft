@@ -66,6 +66,7 @@ impl From<Execution> for tes::v1::types::task::Executor {
             stdout: execution.stdout,
             stderr: execution.stderr,
             env,
+            ignore_error: Some(true),
         }
     }
 }
