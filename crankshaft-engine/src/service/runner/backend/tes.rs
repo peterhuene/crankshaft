@@ -15,6 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crankshaft_config::backend::tes::Config;
 use eyre::Context;
+use eyre::ContextCompat;
 use eyre::Result;
 use eyre::bail;
 use futures::FutureExt as _;
@@ -129,6 +130,8 @@ impl Backend {
                             info!("TES task `{task_id}` (task `{name}`) has failed");
                         }
 
+                        dbg!(&task);
+
                         // Task has completed, so notify that it started if we haven't already
                         if let Some(started) = started.take() {
                             started.send(()).ok();
@@ -154,7 +157,7 @@ impl Backend {
 
                         // SAFETY: at least one set of logs is always
                         // expected to be returned from the server.
-                        let mut result = NonEmpty::new(statuses.next().unwrap());
+                        let mut result = NonEmpty::new(statuses.next().context("TES server responded with no logs")?);
                         result.extend(statuses);
                         return Ok(result);
                     }
