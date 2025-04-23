@@ -15,8 +15,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crankshaft_config::backend::tes::Config;
 use eyre::Context;
+use eyre::ContextCompat;
 use eyre::Result;
-use eyre::bail;
+use eyre::eyre;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use nonempty::NonEmpty;
@@ -29,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing::trace;
 
+use super::TaskRunError;
 use crate::Task;
 
 /// The default poll interval for querying task status.
@@ -85,14 +87,14 @@ impl Backend {
         name: &str,
         interval: Duration,
         mut started: Option<oneshot::Sender<()>>,
-    ) -> Result<NonEmpty<ExitStatus>> {
+    ) -> Result<NonEmpty<ExitStatus>, TaskRunError> {
         info!("TES task `{task_id}` (task `{name}`) has been created; waiting for task to start");
 
         loop {
             let task = client
                 .get_task(task_id, View::Minimal)
                 .await
-                .context("failed to get task information")?
+                .context("failed to get task information from TES server")?
                 .into_minimal()
                 .unwrap();
 
@@ -113,12 +115,36 @@ impl Backend {
                             started.send(()).ok();
                         }
                     }
-                    State::Complete | State::ExecutorError | State::SystemError => {
-                        // Repeat with a basic request
+                    State::Canceling => {
+                        // Task is canceling, wait for it to cancel
+                        trace!("task `{task_id}` is canceling; waiting before polling again");
+                    }
+                    State::SystemError => {
+                        // Repeat with a full request to get the system logs.
+                        let task = client
+                            .get_task(task_id, View::Full)
+                            .await
+                            .context("failed to get task information from TES server")?
+                            .into_task()
+                            .unwrap();
+
+                        let messages = task
+                            .logs
+                            .unwrap_or_default()
+                            .last()
+                            .and_then(|l| l.system_logs.as_ref().map(|l| l.join("\n")))
+                            .unwrap_or_default();
+
+                        return Err(TaskRunError::Other(eyre!(
+                            "task failed due to system error:\n\n{messages}",
+                        )));
+                    }
+                    State::Complete | State::ExecutorError => {
+                        // Repeat with a basic request to get executor logs
                         let task = client
                             .get_task(task_id, View::Basic)
                             .await
-                            .context("failed to get task information")?
+                            .context("failed to get task information from TES server")?
                             .into_task()
                             .unwrap();
 
@@ -134,31 +160,38 @@ impl Backend {
                             started.send(()).ok();
                         }
 
-                        let mut statuses = task
-                            .logs
-                            .unwrap()
-                            .into_iter()
-                            .flat_map(|task| task.logs)
-                            .map(|log| {
-                                let status = log.exit_code.expect("exit code to be present");
+                        // There may be multiple task logs due to internal retries by the TES server
+                        // Therefore, we're only interested in the last log
+                        let logs = task.logs.unwrap_or_default();
+                        let task = logs.last().context(
+                            "invalid response from TES server: completed task is missing task logs",
+                        )?;
 
-                                // See WEXITSTATUS from wait(2) to explain the shift
-                                #[cfg(unix)]
-                                let status = ExitStatus::from_raw((status as i32) << 8);
+                        // Iterate the exit code from each executor log
+                        let mut statuses = task.logs.iter().map(|executor| {
+                            // TODO: TES should always return an exit code
+                            // see: https://github.com/microsoft/ga4gh-tes/issues/860
+                            let status = executor.exit_code.unwrap_or_default();
 
-                                #[cfg(windows)]
-                                let status = ExitStatus::from_raw(status);
+                            // See WEXITSTATUS from wait(2) to explain the shift
+                            #[cfg(unix)]
+                            let status = ExitStatus::from_raw((status as i32) << 8);
 
-                                status
-                            });
+                            #[cfg(windows)]
+                            let status = ExitStatus::from_raw(status);
 
-                        // SAFETY: at least one set of logs is always
-                        // expected to be returned from the server.
-                        let mut result = NonEmpty::new(statuses.next().unwrap());
+                            status
+                        });
+
+                        let mut result = NonEmpty::new(statuses.next().context(
+                            "invalid response from TES server: completed task is missing executor \
+                             logs",
+                        )?);
                         result.extend(statuses);
                         return Ok(result);
                     }
-                    State::Canceled => bail!("task has been cancelled"),
+                    State::Canceled => return Err(TaskRunError::Canceled),
+                    State::Preempted => return Err(TaskRunError::Preempted),
                 }
             }
 
@@ -179,14 +212,14 @@ impl crate::Backend for Backend {
         task: Task,
         started: Option<oneshot::Sender<()>>,
         token: CancellationToken,
-    ) -> Result<BoxFuture<'static, Result<NonEmpty<ExitStatus>>>> {
+    ) -> Result<BoxFuture<'static, Result<NonEmpty<ExitStatus>, TaskRunError>>> {
         let client = self.client.clone();
         let name = task.name.clone();
         let task: tes::v1::types::Task = tes::v1::types::Task::try_from(task)?;
         let interval = self.interval;
 
         Ok(async move {
-            let task_id = client.create_task(task).await?.id;
+            let task_id = client.create_task(task).await.map_err(|e| TaskRunError::Other(e.into()))?.id;
 
             select! {
                 // Always poll the cancellation token first
@@ -194,8 +227,8 @@ impl crate::Backend for Backend {
 
                 _ = token.cancelled() => {
                     // Cancel the task
-                    client.cancel_task(&task_id).await?;
-                    bail!("task has been cancelled")
+                    client.cancel_task(&task_id).await.map_err(|e| TaskRunError::Other(e.into()))?;
+                    Err(TaskRunError::Canceled)
                 }
                 res = Self::wait_task(&client, &task_id, name.as_deref().unwrap_or("<unnamed>"), interval, started) => {
                     res

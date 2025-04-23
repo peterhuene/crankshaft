@@ -18,6 +18,7 @@ use crankshaft_docker::Docker;
 use crankshaft_docker::service::Service;
 use eyre::Context;
 use eyre::ContextCompat;
+use eyre::Result;
 use eyre::bail;
 use eyre::eyre;
 use futures::FutureExt;
@@ -30,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::info;
 
-use crate::Result;
+use super::TaskRunError;
 use crate::Task;
 use crate::task::Input;
 
@@ -321,7 +322,7 @@ impl crate::Backend for Backend {
         task: Task,
         mut started: Option<oneshot::Sender<()>>,
         token: CancellationToken,
-    ) -> Result<BoxFuture<'static, Result<NonEmpty<ExitStatus>>>> {
+    ) -> Result<BoxFuture<'static, Result<NonEmpty<ExitStatus>, TaskRunError>>> {
         // Helper for cleanup
         enum Cleaner {
             /// The cleanup is for a container.
@@ -372,7 +373,7 @@ impl crate::Backend for Backend {
 
             for execution in task.executions {
                 if token.is_cancelled() {
-                    bail!("task has been cancelled");
+                    return Err(TaskRunError::Canceled);
                 }
 
                 // First ensure the execution's image exists
@@ -445,7 +446,7 @@ impl crate::Backend for Backend {
                         builder = builder.work_dir(work_dir);
                     }
 
-                    let service = Arc::new(builder.try_build(&name).await?);
+                    let service = Arc::new(builder.try_build(&name).await.map_err(|e| TaskRunError::Other(e.into()))?);
                     let started = started.take();
 
                     select! {
@@ -486,7 +487,7 @@ impl crate::Backend for Backend {
                     let container = Arc::new(
                         builder
                             .try_build(name.clone())
-                            .await?,
+                            .await.map_err(|e| TaskRunError::Other(e.into()))?,
                     );
 
                     let started = started.take();
